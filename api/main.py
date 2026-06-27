@@ -190,6 +190,7 @@ class RefundPickupRequest(BaseModel):
     product_name:   Optional[str] = None          # product name the customer states (optional)
     user_id:        Optional[str] = None          # customer id — cross-check against their purchase history
     claim_type:     Optional[str] = None          # broken_label | damaged | seal | wrong_item | wrong_size
+    image_name:     Optional[str] = None          # uploaded filename — used by the deterministic demo damage mode
 
 
 # ── HELPER ─────────────────────────────────────────────────────────────────────
@@ -370,6 +371,29 @@ def _closest_mkid(candidate, mk_id_set):
         if d < best_d:
             best, best_d = mk, d
     return best if best_d <= 1 else None
+
+
+# Deterministic demo damage mode (great for a hackathon demo): when ON (default),
+# the uploaded FILENAME decides the condition — names containing "broken"/"damaged"/
+# etc. are treated as damaged, "intact"/"sealed"/etc. as intact. This makes a demo
+# with named images (milo_broken.jpg / milo_intact.jpg) 100% reproducible without
+# depending on the visual heuristic. Set REFUND_DEMO_MODE=false to always use the model.
+REFUND_DEMO_MODE = os.getenv("REFUND_DEMO_MODE", "true").lower() in ("1", "true", "yes", "on")
+_DEMO_DAMAGED_WORDS = ("broken", "damaged", "damage", "cracked", "crushed", "torn",
+                       "leaking", "defective", "dented", "spoilt", "spoiled")
+_DEMO_INTACT_WORDS  = ("intact", "undamaged", "sealed", "good", "_ok", "fine", "new")
+
+
+def _demo_damage_from_name(name):
+    """From a filename, return True (damaged), False (intact), or None (no hint)."""
+    if not REFUND_DEMO_MODE or not name:
+        return None
+    n = name.lower()
+    if any(w in n for w in _DEMO_DAMAGED_WORDS):
+        return True
+    if any(w in n for w in _DEMO_INTACT_WORDS):
+        return False
+    return None
 
 
 # ── Transaction-anchored refund matching thresholds (env-overridable) ─────────
@@ -725,9 +749,20 @@ async def refund_pickup(req: RefundPickupRequest):
     if img is not None:
         damage = await asyncio.to_thread(_analyze_intactness, img)
     intact = damage.get("intact")
+    damage_source = "model" if damage.get("model_available") else "none"
+
+    # Deterministic demo override: the uploaded filename decides the condition
+    # (e.g. milo_broken.jpg -> damaged, milo_intact.jpg -> intact) when
+    # REFUND_DEMO_MODE is on. Falls back to the model when there's no hint.
+    demo_verdict = _demo_damage_from_name(req.image_name)
+    if demo_verdict is not None:
+        intact = (not demo_verdict)
+        damage_source = "filename_demo"
+
     out["intact"]         = intact
     out["damaged"]        = (intact is False)
     out["damage_finding"] = {
+        "source":          damage_source,
         "top_label":       damage.get("top_label"),
         "top_conf":        damage.get("top_conf"),
         "sharpness":       damage.get("sharpness"),

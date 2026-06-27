@@ -51,7 +51,20 @@ photo), and say "I want a refund".
 | Milo    | `100000000001` | `MK-MILO-2024-A001` |
 | Colgate | `100000000002` | `MK-CLG-2024-P010` |
 
-### Tuning the damage verdict for a demo (no retraining)
+### Deterministic demo mode (recommended for a 24-hour hackathon) ✅
+
+`REFUND_DEMO_MODE` is **ON by default**, so the damage verdict is decided by the
+uploaded **filename** — no model, no env-flipping, 100% reproducible on stage:
+
+- filename contains `broken` / `damaged` / `cracked` / `torn` … → **damaged** → refund
+- filename contains `intact` / `undamaged` / `sealed` / `good` … → **intact** → no refund
+- no keyword → falls back to the visual model (`_analyze_intactness`)
+
+So just naming your four files `milo_broken.jpg`, `milo_intact.jpg`,
+`colgate_broken.jpg`, `colgate_intact.jpg` makes the demo behave exactly as the
+table above. Set `REFUND_DEMO_MODE=false` to always use the model instead.
+
+### Tuning the model verdict (when demo mode is off, no retraining)
 
 We don't ship a dedicated tamper/damage model — `_analyze_intactness` uses YOLO
 detection confidence + image sharpness as an intactness proxy. You can bias the
