@@ -456,7 +456,10 @@ def _analyze_intactness(img) -> dict:
     except Exception:
         sharpness = 0.0
     model_available = yolo_model is not None and bool(dets)
-    intact = bool(model_available and top_conf >= AUDIT_INTACT_THRESHOLD and sharpness >= 50.0)
+    # intact is True/False only when the model actually located a product; when it
+    # couldn't (model not loaded or nothing detected) it's None → "inconclusive",
+    # NOT "damaged" (avoids mislabeling an unreadable photo as damaged).
+    intact = (top_conf >= AUDIT_INTACT_THRESHOLD and sharpness >= 50.0) if model_available else None
     return {
         "top_label":       top_label,
         "top_conf":        round(top_conf, 3),
