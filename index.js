@@ -1079,7 +1079,7 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
 });
 
 app.post('/api/checkout/match-verify', isAuth, async (req, res) => {
-    const { barcode, product_ocr, barcode_ocr, yolo_label, mk_id } = req.body;
+    const { barcode, product_ocr, barcode_ocr, yolo_label, mk_id, image_b64 } = req.body;
 
     if (!barcode || typeof barcode !== 'string' || barcode.trim().length < 4)
         return res.status(400).json({ found: false, match: false, message: 'Invalid barcode.' });
@@ -1121,7 +1121,10 @@ app.post('/api/checkout/match-verify', isAuth, async (req, res) => {
             barcode_ocr:   barcode_ocr   || '',
             yolo_label:    yolo_label    || '',
             mk_id:         (mk_id && String(mk_id).trim()) || null,
-        }, { timeout: 10000 });
+            // Forward the product image so FastAPI can run server-side OCR and
+            // cross-verify the label against the barcode's product (swap detection).
+            image_b64:     image_b64 || null,
+        }, { timeout: 20000 });
         return res.status(200).json(faResp.data);
     } catch {
         // If match failed, remove the UID we just added so the customer can retry

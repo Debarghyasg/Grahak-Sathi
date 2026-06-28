@@ -105,7 +105,13 @@ function ScanCapture({ onVerified, scanning, setScanning }) {
 
   function submitMkId() {
     if (!productB64 || barcodeInput.trim().length < 4 || scanning) return
-    // MK ID is optional but recommended — proceed to verify
+    // MK ID is MANDATORY — it's the manufacturer serial used to detect swapped /
+    // counterfeit units at checkout. Don't proceed without it.
+    if (mkIdInput.trim().length < 3) {
+      showToast('MK ID (manufacturer serial) is required to verify this unit.', 'warn')
+      mkIdFieldRef.current?.focus()
+      return
+    }
     setStep('ready')
   }
 
@@ -418,7 +424,7 @@ function ScanCapture({ onVerified, scanning, setScanning }) {
 
             <div style={{ display:'flex', alignItems:'center', gap:10, marginTop:12 }}>
               <span style={{ flex:1, fontFamily:'monospace', fontSize:10, color:'#4c1d95', letterSpacing:'.6px' }}>
-                ⏎ press <span style={{ color:'#fcd34d' }}>Enter</span> to verify · MK ID helps prevent duplicates
+                ⏎ press <span style={{ color:'#fcd34d' }}>Enter</span> to verify · MK ID is required
               </span>
               <button onClick={() => setStep('barcode')} style={{
                 padding:'10px 14px', borderRadius:10, cursor:'pointer',
@@ -561,9 +567,10 @@ export default function TransactionPage({ user, setUser }) {
       return
     }
 
-    const type = !data.found                             ? 'mismatch'
-               : data.match                              ? 'match'
-               : data.fraud_type === 'LOW_CONFIDENCE'   ? 'partial'
+    const type = !data.found                                                          ? 'mismatch'
+               : data.match                                                           ? 'match'
+               : (data.fraud_type === 'LOW_CONFIDENCE' ||
+                  data.fraud_type === 'LABEL_UNREADABLE')                              ? 'partial'
                : 'mismatch'
 
     const item = {
@@ -580,11 +587,11 @@ export default function TransactionPage({ user, setUser }) {
 
     if (type === 'mismatch') {
       setFraudCount(f => f + 1)
-      showToast(`Fraud detected — ${data.fraud_type || 'mismatch'} · Item rejected`, 'error')
+      showToast(data.message || `Fraud detected — ${data.fraud_type || 'mismatch'} · Item rejected`, 'error')
       setScannerOpen(false)
       return
     } else if (type === 'partial') {
-      showToast(`Partial match — ${data.product_name} · Item NOT added (barcode/image mismatch)`, 'warn')
+      showToast(data.message || `Partial match — ${data.product_name} · Item NOT added (barcode/image mismatch)`, 'warn')
       setScannerOpen(false)
       return
     } else {

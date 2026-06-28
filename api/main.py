@@ -910,28 +910,99 @@ async def get_mk_ids(barcode: str):
     }
 
 
-# ── POST /match — image upload + YOLO integration point ───────────────────────
+# ── POST /match — image upload + OCR cross-verification ───────────────────────
+MATCH_TRUST_THRESHOLD = 60   # min fuzzy similarity (0-100) of label text vs DB name
+
+
+def cross_verify_label(product_name: str, ocr_lines: list[str]) -> tuple[float, str]:
+    """Best fuzzy similarity (0-100) between the DB product name and any text line
+    read off the physical product label.
+
+    This is the real barcode-swap / ticket-switch detector: the scanned barcode
+    tells us what the product SHOULD be (product_name); the label OCR tells us what
+    it ACTUALLY is. A low score means the package doesn't match the scanned barcode.
+
+    NOTE: the YOLO model here is a 2-class (product/barcode) *detector* and cannot
+    identify which product it is, so product identity is verified via OCR, not YOLO.
+    """
+    if not product_name:
+        return 0.0, ""
+    best, best_line = 0.0, ""
+    for line in ocr_lines:
+        if not line or not line.strip():
+            continue
+        score = max(
+            fuzz.partial_ratio(product_name.lower(), line.lower()),
+            fuzz.token_set_ratio(product_name.lower(), line.lower()),
+        )
+        if score > best:
+            best, best_line = float(score), line
+    return best, best_line
+
+
+async def known_serials_for_barcode(barcode: str) -> tuple[set, bool]:
+    """Return (set of valid MK-IDs upper-cased, has_any_source).
+
+    Unions the demo MOCK_DB serials with a DB-backed product_serials table so that
+    real inventory — not just the 4 demo products — has a serial source of truth.
+    has_any_source is False only when NO catalogue knows this barcode's serials.
+    """
+    from product_catalog import MOCK_DB
+    serials = set()
+    mock = MOCK_DB.get(barcode)
+    if mock:
+        serials.update(m.upper() for m in mock.get("mk_ids", []))
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT mk_id FROM product_serials WHERE barcode=$1", barcode
+            )
+        serials.update((r["mk_id"] or "").upper() for r in rows if r["mk_id"])
+    except Exception as e:
+        # product_serials table not migrated yet → fall back to MOCK_DB only.
+        print(f"[match] product_serials lookup skipped ({e})")
+    return serials, bool(serials)
+
+
 @app.post("/match")
 async def match_verify(req: MatchRequest):
     """
-    Called from home.html image-upload flow and optionally from the
-    checkout terminal when a camera image is available.
+    Live checkout product verification.
 
-    Flow:
-      1. If image_b64 is provided → run YOLO to detect product label
-      2. Look up barcode in DB
-      3. Fuzzy-match yolo_label + OCR text against DB product name
-      4. Return fraud risk + match verdict
+    Detection strategy:
+      1. Read the product label via server-side OCR (EasyOCR) on the uploaded
+         image, augmented by any client-side OCR text.
+      2. Look up the scanned barcode in the products table.
+      3. Cross-verify the label text against the barcode's product name. A poor
+         match means the physical product doesn't match the scanned barcode
+         (barcode swap / ticket switching).
+      4. Validate the MK-ID (manufacturer serial) — MANDATORY — against the
+         serial catalogue (DB product_serials ∪ MOCK_DB). No fail-open.
     """
-    # Step 1 — YOLO inference if image provided
-    yolo_label = req.yolo_label or ""
+    # ── Step 1 — server-side OCR (reliable) + any client OCR ──────────────────
+    ocr_lines: list[str] = []
     if req.image_b64:
-        detected = run_yolo(req.image_b64)
-        if detected:
-            yolo_label = " ".join(detected)
-            print(f"🔍 YOLO detected: {yolo_label}")
+        try:
+            img = await asyncio.to_thread(_decode_image, req.image_b64)
+            ocr_lines = await asyncio.to_thread(_ocr_texts, img)
+        except Exception as e:
+            print(f"[match] image OCR failed: {e}")
+    if req.product_ocr and req.product_ocr.strip():
+        ocr_lines.append(req.product_ocr.strip())
 
-    # Step 2 — DB lookup (barcode is globally unique across shops)
+    # YOLO (2-class product/barcode detector) is informational only — it confirms
+    # a product is present but cannot identify which product, so it does NOT score
+    # product identity (that would falsely flag genuine items).
+    yolo_label = req.yolo_label or ""
+    if req.image_b64 and yolo_model is not None:
+        try:
+            detected = run_yolo(req.image_b64)
+            if detected:
+                yolo_label = " ".join(detected)
+        except Exception:
+            pass
+
+    # ── Step 2 — DB lookup (barcode is globally unique across shops) ──────────
     async with db_pool.acquire() as conn:
         product = await conn.fetchrow(
             "SELECT product_name, price, quantity, barcode_format "
@@ -946,27 +1017,37 @@ async def match_verify(req: MatchRequest):
             "confidence":   0,
             "fraud_type":   "BARCODE_NOT_FOUND",
             "product_name": None,
+            "message":      f"Barcode {req.barcode_value} not found in inventory.",
         }
 
     product = dict(product)
 
-    # Step 3 — Fraud risk scoring
-    combined_ocr = (req.product_ocr or "") + " " + (req.barcode_ocr or "")
-    fraud_risk   = compute_fraud_risk(product, yolo_label, combined_ocr)
-    yolo_conf    = fuzz.token_sort_ratio(
-        yolo_label.lower(), product["product_name"].lower()
-    ) if yolo_label else 50
+    # ── Step 3 — OCR cross-verification (barcode-swap / ticket-switch detector) ─
+    trust_score, matched_text = cross_verify_label(product["product_name"], ocr_lines)
+    have_ocr   = any(l and l.strip() for l in ocr_lines)
+    fraud_risk = round(max(0.0, 1.0 - trust_score / 100.0), 2)
 
-    fraud_type = None
-    if fraud_risk > 0.7 and yolo_label:
-        fraud_type = "LABEL_SWAP" if yolo_conf < 30 else "PARTIAL_MISMATCH"
-    elif fraud_risk > 0.55:
-        fraud_type = "LOW_CONFIDENCE"
+    if not have_ocr:
+        # Label could not be read at all → cannot confirm the product. Don't
+        # silently trust the barcode; require manual review (not added to cart).
+        match      = False
+        fraud_type = "LABEL_UNREADABLE"
+        message    = "Could not read the product label — manual verification required."
+    elif trust_score >= MATCH_TRUST_THRESHOLD:
+        match      = True
+        fraud_type = None
+        message    = f"Product verified: {product['product_name']}"
+    else:
+        match      = False
+        fraud_type = "PRODUCT_MISMATCH"
+        message    = (f"Possible barcode swap — barcode says "
+                      f"'{product['product_name']}' but the label reads "
+                      f"'{matched_text or 'something else'}' (match only {int(trust_score)}%).")
 
     result = {
         "found":          True,
-        "match":          fraud_risk <= 0.5,
-        "confidence":     max(0, 100 - int(fraud_risk * 100)),
+        "match":          match,
+        "confidence":     int(trust_score),
         "fraud_type":     fraud_type,
         "fraud_risk":     fraud_risk,
         "product_name":   product["product_name"],
@@ -974,29 +1055,36 @@ async def match_verify(req: MatchRequest):
         "quantity":       product["quantity"],
         "barcode_format": product["barcode_format"],
         "yolo_label":     yolo_label or None,
+        "ocr_text":       matched_text or None,
+        "message":        message,
     }
 
-    # ── MK-ID (manufacturer serial) validation — counterfeit / swapped-unit check ──
-    # The barcode + image may match the genuine product, but a SWAPPED/incorrect
-    # MK-ID means this physical unit isn't a genuine serial. Only enforce when we
-    # actually know the valid serials for this barcode (product_catalog); this is
-    # a lightweight import (no YOLO/EasyOCR).
-    if req.mk_id:
-        from product_catalog import validate_mk_id, is_known_barcode
-        result["mk_id"] = req.mk_id
-        if is_known_barcode(req.barcode_value):
-            valid = validate_mk_id(req.barcode_value, req.mk_id)
-            result["mk_id_valid"] = valid
-            if not valid:
-                result["match"]      = False
-                result["confidence"] = 0
-                result["fraud_type"] = "MK_ID_MISMATCH"
-                result["message"]    = (f"MK ID '{req.mk_id}' is not a valid serial for "
-                                        f"{product['product_name']} (barcode {req.barcode_value}) — "
-                                        f"possible counterfeit or swapped unit.")
-        else:
-            # No serial list for this barcode → the MK-ID can't be verified.
-            result["mk_id_valid"] = None
+    # ── Step 4 — MK-ID (manufacturer serial) validation — MANDATORY, no fail-open ──
+    mk_id = (req.mk_id or "").strip()
+    result["mk_id"] = mk_id or None
+    if not mk_id:
+        result["match"]       = False
+        result["confidence"]  = 0
+        result["fraud_type"]  = "MK_ID_REQUIRED"
+        result["mk_id_valid"] = False
+        result["message"]     = "MK ID (manufacturer serial) is required to verify this unit."
+        return result
+
+    serials, has_source = await known_serials_for_barcode(req.barcode_value)
+    if has_source:
+        valid = mk_id.upper() in serials
+        result["mk_id_valid"] = valid
+        if not valid:
+            result["match"]      = False
+            result["confidence"] = 0
+            result["fraud_type"] = "MK_ID_MISMATCH"
+            result["message"]    = (f"MK ID '{mk_id}' is not a valid serial for "
+                                    f"{product['product_name']} (barcode {req.barcode_value}) — "
+                                    f"possible counterfeit or swapped unit.")
+    else:
+        # No serial catalogue for this barcode → serial can't be cryptographically
+        # verified, but it is recorded. Identity still gated by OCR cross-verify above.
+        result["mk_id_valid"] = None
 
     return result
 
