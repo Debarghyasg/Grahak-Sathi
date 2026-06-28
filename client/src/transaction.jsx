@@ -512,21 +512,24 @@ export default function TransactionPage({ user, setUser }) {
   const [fraudCount, setFraudCount] = useState(0)
 
   useEffect(() => {
-    if (initialMatch && initialMatch.match !== false) {
-      const type = !initialMatch.found ? 'mismatch'
-                 : initialMatch.match  ? 'match'
-                 : initialMatch.fraud_type === 'LOW_CONFIDENCE' ? 'partial'
-                 : 'mismatch'
-      addToCart({
-        productName:   initialMatch.product_name  || 'Unknown',
-        price:         initialMatch.price          || null,
-        barcode:       initialBarcode?.barcodeValue || '',
-        confidence:    initialMatch.confidence     || 0,
-        fraudRisk:     initialMatch.fraud_risk     || 0,
-        type,
-        productThumb:  initialProduct?.base64      || null,
-      })
-    }
+    if (!initialMatch) return
+    const type = !initialMatch.found ? 'mismatch'
+               : initialMatch.match  ? 'match'
+               : initialMatch.fraud_type === 'LOW_CONFIDENCE' ? 'partial'
+               : 'mismatch'
+    // Only a genuine match is auto-added to the cart. Previously this added
+    // whenever `match !== false`, so a partial/mismatched initial scan (e.g. a
+    // swapped barcode carried over from the landing scan) still entered the cart.
+    if (type !== 'match') return
+    addToCart({
+      productName:   initialMatch.product_name  || 'Unknown',
+      price:         initialMatch.price          || null,
+      barcode:       initialBarcode?.barcodeValue || '',
+      confidence:    initialMatch.confidence     || 0,
+      fraudRisk:     initialMatch.fraud_risk     || 0,
+      type,
+      productThumb:  initialProduct?.base64      || null,
+    })
   }, [])
 
   // No session polling needed — admin stays logged in, controls flow via UI

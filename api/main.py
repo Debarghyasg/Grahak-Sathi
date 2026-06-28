@@ -582,6 +582,12 @@ async def get_mk_ids(barcode: str):
 
 
 # ── POST /match — image upload + YOLO integration point ───────────────────────
+# Minimum OCR-vs-product-name similarity (0..1) required to accept that the
+# photographed item matches the scanned barcode. Below it the scan is treated as
+# a mismatch (not added); env-overridable.
+MATCH_OCR_FLOOR = float(os.getenv("MATCH_OCR_FLOOR", "0.5"))
+
+
 @app.post("/match")
 async def match_verify(req: MatchRequest):
     """
@@ -620,31 +626,57 @@ async def match_verify(req: MatchRequest):
         }
 
     product = dict(product)
+    db_name = product["product_name"] or ""
 
-    # Step 3 — Fraud risk scoring
-    combined_ocr = (req.product_ocr or "") + " " + (req.barcode_ocr or "")
-    fraud_risk   = compute_fraud_risk(product, yolo_label, combined_ocr)
-    yolo_conf    = fuzz.token_sort_ratio(
-        yolo_label.lower(), product["product_name"].lower()
-    ) if yolo_label else 50
+    # Step 3 — Product-identity verification.
+    # The ONLY reliable signal that the photographed item matches the SCANNED
+    # barcode is the product's label text (OCR). The retail YOLO model only knows
+    # generic "product"/"barcode" classes, so it cannot confirm identity and is
+    # NOT used to approve a match. The raw barcode digits (barcode_ocr) are also
+    # ignored as identity evidence — only the product label OCR counts.
+    product_ocr = (req.product_ocr or "").strip()
+    has_ocr = sum(c.isalpha() for c in product_ocr) >= 3   # real label text, not empty/digits
 
-    fraud_type = None
-    if fraud_risk > 0.7 and yolo_label:
-        fraud_type = "LABEL_SWAP" if yolo_conf < 30 else "PARTIAL_MISMATCH"
-    elif fraud_risk > 0.55:
-        fraud_type = "LOW_CONFIDENCE"
-
-    return {
+    base = {
         "found":          True,
-        "match":          fraud_risk <= 0.5,
-        "confidence":     max(0, 100 - int(fraud_risk * 100)),
-        "fraud_type":     fraud_type,
-        "fraud_risk":     fraud_risk,
         "product_name":   product["product_name"],
         "price":          float(product["price"]) if product["price"] else None,
         "quantity":       product["quantity"],
         "barcode_format": product["barcode_format"],
         "yolo_label":     yolo_label or None,
+    }
+
+    # No readable label → we CANNOT verify the item matches the barcode, so we do
+    # NOT auto-add it. Returned as LOW_CONFIDENCE so the UI treats it as "partial"
+    # (not added) and asks for a clearer photo — instead of defaulting to a match.
+    if not has_ocr:
+        return {
+            **base,
+            "match":      False,
+            "confidence": 25,
+            "fraud_risk": 0.6,
+            "fraud_type": "LOW_CONFIDENCE",
+            "message":    "Couldn't read the product label clearly — please retake a well-lit photo "
+                          "of the product so we can verify it matches the barcode.",
+        }
+
+    # Positive corroboration: OCR text vs the barcode's product name.
+    ocr_score  = max(
+        fuzz.token_set_ratio(product_ocr.lower(), db_name.lower()),
+        fuzz.partial_ratio(product_ocr.lower(), db_name.lower()),
+    ) / 100.0
+    matched    = ocr_score >= MATCH_OCR_FLOOR
+    fraud_risk = round(max(0.0, 1.0 - ocr_score), 2)
+    fraud_type = None if matched else ("LABEL_SWAP" if ocr_score < 0.30 else "PARTIAL_MISMATCH")
+
+    return {
+        **base,
+        "match":      matched,
+        "confidence": int(round(ocr_score * 100)),
+        "fraud_risk": fraud_risk,
+        "fraud_type": fraud_type,
+        "message":    None if matched else
+                      f"The product in the photo doesn't match the scanned barcode ({db_name}).",
     }
 
 
