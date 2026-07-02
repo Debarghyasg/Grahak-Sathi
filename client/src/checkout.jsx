@@ -262,7 +262,16 @@ export default function CheckoutPage({ user, setUser }) {
       if (res.status === 409) {
         const dupData = await res.json().catch(()=>({}))
         showToast(dupData.message || 'This product was already scanned in this session', 'warn')
-        setVerdict({ status:'duplicate_uid', barcode, message: dupData.message || 'Duplicate UID — already scanned in this session' })
+        // Already scanned in this session → open its order-status page (with txn number).
+        navigate('/order-status', { state: {
+          transactionId: dupData.transaction_id || null,
+          status:        dupData.order_status || 'recorded',
+          productName:   dupData.product_name || null,
+          price:         dupData.price ?? null,
+          barcode:       dupData.barcode || barcode,
+          mkId:          dupData.mk_id || null,
+          scannedAt:     dupData.scanned_at || null,
+        }})
         return
       }
       if (!res.ok) {

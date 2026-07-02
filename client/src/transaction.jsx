@@ -559,6 +559,16 @@ export default function TransactionPage({ user, setUser }) {
     if (data.status === 'duplicate_uid') {
       showToast(data.message || 'This product was already scanned in this session.', 'warn')
       setScannerOpen(false)
+      // Already scanned in this session → open its order-status page (with txn number).
+      navigate('/order-status', { state: {
+        transactionId: data.transaction_id || null,
+        status:        data.order_status || 'recorded',
+        productName:   data.product_name || null,
+        price:         data.price ?? null,
+        barcode:       data.barcode || barcodeValue,
+        mkId:          data.mk_id || null,
+        scannedAt:     data.scanned_at || null,
+      }})
       return
     }
 

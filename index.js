@@ -1708,6 +1708,32 @@ async function onCaptureAutoApprove(shopId, txnRef, barcode, product_name, recor
 
 // ── CHECKOUT ──────────────────────────────────────────────────────────────────
 
+// ── Session scan registry ─────────────────────────────────────────────────────
+// Each unit scanned in a checkout session gets a transaction reference + status
+// recorded here (Redis, session-scoped). A re-scan of the same unit returns this
+// so the client can open its order-status page — instead of just warning — with
+// the item's transaction number.
+const SESSION_SCAN_TTL_S = 4 * 60 * 60; // 4h — matches the UID set / customer session
+
+function sessionScanKey(sessionToken, uidValue) { return `session:scan:${sessionToken}:${uidValue}`; }
+function sessionOrderKey(transactionId)          { return `session:order:${transactionId}`; }
+
+async function getSessionScan(sessionToken, uidValue) {
+    try { const raw = await redisClient.get(sessionScanKey(sessionToken, uidValue)); return raw ? JSON.parse(raw) : null; }
+    catch (e) { console.warn('session scan read failed (non-fatal):', e.message); return null; }
+}
+
+// Store (or refresh) a scanned unit's record under both the session+uid key (for
+// duplicate-scan lookup) and a transaction-number key (for the order-status page).
+async function putSessionScan(sessionToken, uidValue, info) {
+    const rec = { scanned_at: new Date().toISOString(), ...info };
+    try {
+        await redisClient.set(sessionScanKey(sessionToken, uidValue), JSON.stringify(rec), { EX: SESSION_SCAN_TTL_S });
+        if (rec.transaction_id) await redisClient.set(sessionOrderKey(rec.transaction_id), JSON.stringify(rec), { EX: SESSION_SCAN_TTL_S });
+    } catch (e) { console.warn('session scan store failed (non-fatal):', e.message); }
+    return rec;
+}
+
 app.post('/api/checkout/verify', isAuth, async (req, res) => {
     const { barcode, mk_id } = req.body;
     if (!barcode || typeof barcode !== 'string' || barcode.trim().length < 4)
@@ -1724,21 +1750,34 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
     const uidKey       = `session:uids:${sessionToken}`;
     const uidValue     = mk_id ? `${barcode.trim()}:${mk_id.trim()}` : barcode.trim();
 
+    let firstScanInSession = true;
     try {
         // SADD returns 0 if the member already existed in the set
         const added = await redisClient.sAdd(uidKey, uidValue);
         // Set expiry on the UID set (4 hours — matches customer session max)
-        await redisClient.expire(uidKey, 4 * 60 * 60);
+        await redisClient.expire(uidKey, SESSION_SCAN_TTL_S);
 
         if (added === 0) {
-            console.warn(`🚫 Duplicate UID rejected: ${uidValue} in session ${sessionToken}`);
+            firstScanInSession = false;
+            // Already scanned this unit in the session → return its recorded order
+            // status + transaction number so the client opens the order-status page.
+            const prior = await getSessionScan(sessionToken, uidValue);
+            console.warn(`🚫 Duplicate UID: ${uidValue} in session ${sessionToken} → transaction ${prior?.transaction_id || 'n/a'}`);
             return res.status(409).json({
                 status:  'duplicate_uid',
-                message: mk_id
-                    ? `This product (barcode: ${barcode}, MK ID: ${mk_id}) was already scanned in this session.`
-                    : `Barcode ${barcode} already scanned in this session. If this is a different unit, provide its MK ID (serial number).`,
+                already_scanned: true,
+                transaction_id:  prior?.transaction_id || null,
+                order_status:    prior?.status || 'recorded',
+                product_name:    prior?.product_name || null,
+                price:           prior?.price ?? null,
+                scanned_at:      prior?.scanned_at || null,
                 barcode: barcode.trim(),
                 mk_id:   mk_id || null,
+                message: prior?.transaction_id
+                    ? `This item was already scanned in this session — showing order status for transaction ${prior.transaction_id}.`
+                    : (mk_id
+                        ? `This product (barcode: ${barcode}, MK ID: ${mk_id}) was already scanned in this session.`
+                        : `Barcode ${barcode} already scanned in this session. If this is a different unit, provide its MK ID (serial number).`),
             });
         }
     } catch (redisErr) {
@@ -1828,6 +1867,21 @@ app.post('/api/checkout/verify', isAuth, async (req, res) => {
             );
         } catch (dbErr) {
             console.error('Transaction log error:', dbErr.message);
+        }
+
+        // Record this scanned unit in the session so a RE-scan surfaces its order
+        // status + transaction number (see the duplicate_uid path above).
+        if (firstScanInSession) {
+            const sessionTxnId = generateTransactionId(12);
+            await putSessionScan(sessionToken, uidValue, {
+                transaction_id: sessionTxnId, shop_id: shop.id,
+                barcode:      barcode.trim(),
+                mk_id:        mk_id || null,
+                product_name: verifyResult.product_name || null,
+                price:        verifyResult.price ?? null,
+                status:       verifyResult.status || 'recorded',
+            });
+            verifyResult.transaction_id = sessionTxnId;
         }
 
         if (verifyResult.status === 'blocked' && (verifyResult.fraud_risk || 0) > 0.6) {
@@ -2045,21 +2099,32 @@ app.post('/api/checkout/match-verify', isAuth, async (req, res) => {
     const uidKey       = `session:uids:${sessionToken}`;
     const uidValue     = mk_id ? `${barcode.trim()}:${mk_id.trim()}` : barcode.trim();
 
+    let firstScanInSession = true;
     try {
         const added = await redisClient.sAdd(uidKey, uidValue);
-        await redisClient.expire(uidKey, 4 * 60 * 60);
+        await redisClient.expire(uidKey, SESSION_SCAN_TTL_S);
 
         if (added === 0) {
-            console.warn(`🚫 Duplicate UID rejected (match-verify): ${uidValue} in session ${sessionToken}`);
+            firstScanInSession = false;
+            const prior = await getSessionScan(sessionToken, uidValue);
+            console.warn(`🚫 Duplicate UID rejected (match-verify): ${uidValue} in session ${sessionToken} → transaction ${prior?.transaction_id || 'n/a'}`);
             return res.status(409).json({
                 found:   true,
                 match:   false,
                 status:  'duplicate_uid',
-                message: mk_id
-                    ? `This product (barcode: ${barcode}, MK ID: ${mk_id}) was already scanned in this session.`
-                    : `Barcode ${barcode} already scanned in this session. If this is a different unit, provide its MK ID (serial number).`,
+                already_scanned: true,
+                transaction_id:  prior?.transaction_id || null,
+                order_status:    prior?.status || 'recorded',
+                product_name:    prior?.product_name || null,
+                price:           prior?.price ?? null,
+                scanned_at:      prior?.scanned_at || null,
                 barcode: barcode.trim(),
                 mk_id:   mk_id || null,
+                message: prior?.transaction_id
+                    ? `This item was already scanned in this session — showing order status for transaction ${prior.transaction_id}.`
+                    : (mk_id
+                        ? `This product (barcode: ${barcode}, MK ID: ${mk_id}) was already scanned in this session.`
+                        : `Barcode ${barcode} already scanned in this session. If this is a different unit, provide its MK ID (serial number).`),
             });
         }
     } catch (redisErr) {
@@ -2075,12 +2140,54 @@ app.post('/api/checkout/match-verify', isAuth, async (req, res) => {
             yolo_label:    yolo_label    || '',
             mk_id:         (mk_id && String(mk_id).trim()) || null,
         }, { timeout: 10000 });
-        return res.status(200).json(faResp.data);
+        const data = faResp.data || {};
+
+        // Record this scanned unit so a re-scan surfaces its order status + txn number.
+        if (firstScanInSession) {
+            const sessionTxnId = generateTransactionId(12);
+            await putSessionScan(sessionToken, uidValue, {
+                transaction_id: sessionTxnId, shop_id: shop.id,
+                barcode:      barcode.trim(),
+                mk_id:        mk_id || null,
+                product_name: data.product_name || null,
+                price:        data.price ?? null,
+                status:       data.match ? 'approved' : (data.fraud_type || (data.found ? 'partial' : 'not_found')),
+            });
+            data.transaction_id = sessionTxnId;
+        }
+        return res.status(200).json(data);
     } catch {
         // If match failed, remove the UID we just added so the customer can retry
         try { await redisClient.sRem(uidKey, uidValue); } catch {}
         return res.status(503).json({ found: false, match: false, message: 'Inventory service unavailable.' });
     }
+});
+
+// GET /api/checkout/order-status/:transactionId — status for a transaction number.
+// Checks the session scan registry first (scanned, maybe-unpaid items), then falls
+// back to the DB (return_claims / transactions) for a finalised order. Shop-scoped.
+app.get('/api/checkout/order-status/:transactionId', isAuth, async (req, res) => {
+    const shop = req.session.user;
+    const txn  = String(req.params.transactionId || '').trim();
+    if (!/^\d{6,18}$/.test(txn))
+        return res.status(400).json({ ok: false, message: 'Invalid transaction number.' });
+
+    // 1) Session scan registry — a unit scanned in the current session.
+    try {
+        const raw = await redisClient.get(sessionOrderKey(txn));
+        if (raw) {
+            const rec = JSON.parse(raw);
+            if (rec.shop_id == null || String(rec.shop_id) === String(shop.id)) {
+                return res.json({ ok: true, source: 'session_scan', ...rec });
+            }
+        }
+    } catch (e) { /* fall through to the DB lookup */ }
+
+    // 2) Finalised order in the DB (paid transaction / return claim).
+    const order = await lookupOrder(shop.id, txn).catch(() => null);
+    if (order) return res.json({ ok: true, source: 'order_lookup', transaction_id: txn, ...order });
+
+    return res.status(404).json({ ok: false, message: `No order found for transaction ${txn}.` });
 });
 
 // ── POST /api/checkout/pay ────────────────────────────────────────────────────
