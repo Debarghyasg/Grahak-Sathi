@@ -601,3 +601,6 @@ blocked; legitimate retail messages allowed).
 ## Team
 
 Built by **Team Schrodinger** for **HackArena 2.0**.
+Debarghya Sengupta (Team Leader)
+Imon Dey
+Arshi Parveen
