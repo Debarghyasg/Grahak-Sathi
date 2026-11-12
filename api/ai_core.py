@@ -41,7 +41,9 @@ def extract_mrp_from_image(image_path):
     results = reader.readtext(image_path)
     for (bbox, text, confidence) in results:
         text_clean = text.upper().replace(" ", "")
-        match = re.search(r'(?:MRP|RS|₹)[:\s]?(\d+\.?\d*)', text_clean)
+        match = re.search(r'(?:MRP|RS|₹)[:\s]?(\d+(?:\.\d{1,2})?)',
+                          text_clean
+                        )
         if match:
             return match.group(1)
     return None
@@ -105,13 +107,13 @@ def verify_from_scanner(barcode: str, image_path: str) -> dict:
 
     # Step 2: OCR
     ocr_best, ocr_all = run_ocr_on_image(image_path)
-    result["ocr_best_text"] = ocr_best
     result["ocr_all_texts"] = ocr_all
 
     # Step 3: Cross verify
     trust_score, matched_text = cross_verify(db_product["product_name"], ocr_all)
-    result["trust_score"] = trust_score
 
+    result["trust_score"] = trust_score
+    result["ocr_best_text"] = matched_text if matched_text else ocr_best
     # Step 4: Decision
     if ocr_best == "UNREADABLE":
         result["decision"] = "BLOCK"
@@ -122,7 +124,8 @@ def verify_from_scanner(barcode: str, image_path: str) -> dict:
         result["decision"] = "BLOCK"
         result["fraud_reason"] = (
             f"TICKET SWITCHING DETECTED — Barcode says '{db_product['product_name']}' "
-            f"but label shows '{ocr_best}' (match only {trust_score}%)"
+            f"but label shows '{result['ocr_best_text']}' "
+            f"(match only {trust_score}%)"
         )
 
     result["llm_narrative"] = generate_fraud_narrative(result)
